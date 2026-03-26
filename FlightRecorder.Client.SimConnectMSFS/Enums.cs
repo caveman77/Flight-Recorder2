@@ -19,6 +19,8 @@
         AircraftPositionInitial,
         AircraftPosition,
         AircraftPositionSet,
+        AiAircraftPosition,
+        AiAircraftPositionSet
     }
 
     internal enum DATA_REQUESTS
@@ -27,6 +29,8 @@
         AIRCRAFT_POSITION,
         AI_DESPAWN,
         AI_RELEASE,
+        CHU_LISTAIRCRAFT,
+        CHU_AI_POSITION,
 
         AI_SPAWN = 10000, // 10000 to 19999
     }

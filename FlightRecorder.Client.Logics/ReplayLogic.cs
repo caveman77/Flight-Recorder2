@@ -1,12 +1,17 @@
-﻿using FlightRecorder.Client.SimConnectMSFS;
-using Microsoft.Extensions.Logging;
-using System;
+﻿using System;
+using System.Collections;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
 using System.Linq;
+using System.Numerics;
 using System.Threading.Tasks;
 using System.Timers;
+using FlightRecorder.Client.SimConnectMSFS;
+using Microsoft.Extensions.Logging;
+using Microsoft.VisualBasic;
+using SharpKml.Dom;
+using static System.Runtime.InteropServices.JavaScript.JSType;
 
 namespace FlightRecorder.Client.Logics;
 
@@ -19,42 +24,101 @@ public class ReplayLogic : IReplayLogic, IDisposable
     private const int EventThrottleMilliseconds = 500;
 
     private readonly ILogger<ReplayLogic> logger;
+
+    // SimConnect connector interface
     private readonly IConnector connector;
+
+    // Used to give record duration but also replay duration
     private readonly Stopwatch stopwatch = new();
 
-
+    // Seems to be the start  timing. It can be different from the recording start upon trim
     private long? startMilliseconds;
+
+    // Recording duration (given by Stopwatch)
     private long? endMilliseconds;
     private SimStateStruct? startState;
 
-    public List<(long milliseconds, AircraftPositionStruct position)> Records { get; private set; } = new();
+    // User aircraft
+    public UserAircraft UserAircraft { get; private set; } = new(); 
 
-    public string? AircraftTitle { get; set; }
+    // list of the AI of the Aircraft as recorded (same order as the orther lists)
+    public List<AiAircraft> AiAircraftList = new();
+
+    // ObjectID of the user Aircraft
+    public uint UserArcraftID;
+
+
 
     private int currentFrame;
 
+    // Replay speed rate requested by user
     private double rate = 1;
+
     private bool repeat = false;
     private int? pausedFrame;
+
+    // Replay speed rate save when user pressed pause
     private double? pausedRate;
     private bool isReplayStopping;
     private long? replayMilliseconds;
+
+    // Time between the start of the replay timer and the time when pause has been pressed
     private long? pausedMilliseconds;
+
+    // Offset delay between start and replay start point required by user
     private long offsetStartMilliseconds = 0;
     private bool forceReset = false;
 
-    private AircraftPositionStruct? currentPosition = null;
+    //private AircraftPositionStruct? currentPosition = null;
     private long? lastTriggeredMilliseconds = null;
     private TaskCompletionSource<bool>? tcs;
 
-    public bool IsReplayable => Records.Count > 0;
+    public bool IsReplayable => UserAircraft.Records == null ? false: UserAircraft.Records.Count > 0;
     private bool IsReplaying => replayMilliseconds != null && pausedMilliseconds == null;
     private bool IsPausing => pausedMilliseconds != null;
 
-    private bool IsAI([NotNullWhen(true)] string? aircraftTitle) => !string.IsNullOrEmpty(aircraftTitle);
-    private uint? aiRequestId = null;
-    private uint? aiId = null;
-    // private Timer timer;
+    //private bool IsAI([NotNullWhen(true)] string? aircraftTitle) => !string.IsNullOrEmpty(aircraftTitle);
+
+    private bool playUserAircraft = false;
+    private bool playAiArcraft = false;
+
+    private AiAircraftPositionStruct aidefaultPosition = new AiAircraftPositionStruct
+    {
+        AIBank = 28.999999999999993,
+        AIPitch = -19.999999999999993,
+        AbsoluteTime = 63909094529.924271,
+        Altitude = 2091.9170057785809,
+        AltitudeAboveGround = 9.6935990980027782,
+        Bank = 0,
+        BrakeLeftPosition = 0,
+        BrakeRightPosition = 1,
+        BrakeParkingPosition = 1,
+        Longitude = -16.447037877832933,
+        Latitude = 81.173171823478071
+    };
+
+    private AircraftPositionStruct defaultPosition = new AircraftPositionStruct
+    {
+        AIBank = 28.999999999999993,
+        AIPitch = -19.999999999999993,
+        AbsoluteTime = 63909094529.924271,
+        AccelerationBodyX = 0,
+        AccelerationBodyY = 0,
+        AccelerationBodyZ = 0,
+        AileronPosition = 0,
+        AileronTrimPercent = 0,
+        Altitude = 2091.9170057785809,
+        AltitudeAboveGround = 9.6935990980027782,
+        Bank = 0,
+        BrakeLeftPosition = 0,
+        BrakeRightPosition = 1,
+        BrakeParkingPosition = 1,
+        Longitude = -16.447037877832933,
+        MachAirspeed = 0,
+        Latitude = 81.173171823478071
+    };
+
+
 
     public ReplayLogic(ILogger<ReplayLogic> logger, IConnector connector)
     {
@@ -97,6 +161,12 @@ public class ReplayLogic : IReplayLogic, IDisposable
 
     #region Public Functions
 
+    public void SetReplayScope(bool playUserAircraft, bool playAiArcrafts)
+    {
+        this.playAiArcraft = playAiArcrafts;
+        this.playUserAircraft = playUserAircraft;
+    }
+
     public bool Replay()
     {
         if (!IsReplayable)
@@ -115,16 +185,36 @@ public class ReplayLogic : IReplayLogic, IDisposable
         lastTriggeredMilliseconds = null;
         replayMilliseconds = stopwatch.ElapsedMilliseconds - (long)(offsetStartMilliseconds / rate);
 
-        if (Records.Any())
+        if (UserAircraft.Records.Any())
         {
-            var currentPosition = Records[currentFrame].position;
-            if (IsAI(AircraftTitle))
+
+            if (this.playUserAircraft)
             {
-                aiRequestId = connector.Spawn(AircraftTitle, currentPosition);
+                AircraftPositionStruct? currentPosition = UserAircraft.Records[currentFrame].position;
+
+                if (currentPosition == null)
+                    currentPosition = (AircraftPositionStruct)defaultPosition;
+
+                connector.Init(0, (AircraftPositionStruct)currentPosition);
             }
-            else
+                
+
+            if (this.playAiArcraft)
             {
-                connector.Init(0, currentPosition);
+                foreach (var aircraft in AiAircraftList)
+                {
+                    AiAircraftPositionStruct? aicurrentPosition = new AiAircraftPositionStruct?();
+
+                    if ((aircraft.StartIndex <= currentFrame) && (aircraft.StopIndex >= currentFrame))
+                        aicurrentPosition = aircraft.Records[currentFrame - aircraft.StartIndex].position;
+
+                    // Would need to search for previous frames to see if the planed didn't moved
+                    if (aicurrentPosition == null)
+                        aicurrentPosition = (AiAircraftPositionStruct)aidefaultPosition;
+
+                    aircraft.aiRequestId = connector.Spawn(((SimStateStruct)aircraft.AircraftStatus).AircraftTitle, (AiAircraftPositionStruct)aicurrentPosition);
+                }
+
             }
         }
 
@@ -173,7 +263,7 @@ public class ReplayLogic : IReplayLogic, IDisposable
             {
                 // Resume based on seeked frame
                 if (startMilliseconds == null) throw new InvalidOperationException("Cannot resume without start time!");
-                replayMilliseconds = stopwatch.ElapsedMilliseconds - (long)((Records[frame].milliseconds - startMilliseconds) / rate);
+                replayMilliseconds = stopwatch.ElapsedMilliseconds - (long)((UserAircraft.Records[frame].milliseconds - startMilliseconds) / rate);
             }
 
             // Initialize resumed position
@@ -185,13 +275,23 @@ public class ReplayLogic : IReplayLogic, IDisposable
             {
                 // Ignore to prevent init unnecessarily
             }
-            else if (frame >= 0 && frame < Records.Count)
+            else if (this.playAiArcraft && frame >= 0 && frame < UserAircraft.Records.Count)
             {
-                connector.Init(aiId ?? 0, Records[frame].position);
+                if (this.playUserAircraft)
+                    connector.Init(0, defaultPosition);
+
+                if (this.playAiArcraft)
+                {
+                    foreach (var ai in AiAircraftList)
+                    {
+                        //var cur_pos = Records[i][frame].position;
+                        connector.Init(ai.aiId ?? 0, aidefaultPosition);
+                    }
+                }
             }
             else
             {
-                throw new InvalidOperationException($"Cannot resume at frame {frame} because there are only {Records.Count} frames!");
+                throw new InvalidOperationException($"Cannot resume at frame {frame} because there are only {UserAircraft.Records.Count} frames!");
             }
 
             // Signal unpaused
@@ -226,14 +326,28 @@ public class ReplayLogic : IReplayLogic, IDisposable
         {
             currentFrame = value;
 
-            (var elapsed, var position) = Records[value];
             if (IsPausing)
             {
-                MoveAircraft(elapsed, position, null, null, 0);
+                if (this.playUserAircraft)
+                    MoveAircraft(UserAircraft.UserArcraftID, UserAircraft.Records[value].milliseconds, UserAircraft.Records[value].position, null, null, 0);
+
+                if (this.playAiArcraft)
+                {
+                    foreach (var avion in AiAircraftList)
+                    {
+                        if (avion.aiId != null)
+                        {
+                            if ((avion.StartIndex <= value) && (avion.StopIndex >= value))
+                                MoveAiAircraft((uint)avion.aiId, avion.Records[value - avion.StartIndex].milliseconds, avion.Records[value - avion.StartIndex].position, null, null, 0);
+                        }
+
+                    }
+                }
+
             }
             else if (!IsReplaying)
             {
-                offsetStartMilliseconds = (elapsed - startMilliseconds) ?? 0L;
+                offsetStartMilliseconds = (UserAircraft.Records[value].milliseconds - startMilliseconds) ?? 0L;
             }
         }
     }
@@ -255,12 +369,11 @@ public class ReplayLogic : IReplayLogic, IDisposable
             offsetStartMilliseconds = 0;
         }
 
-        (var currentElapsed, _) = Records[trimFrame];
-        startMilliseconds = currentElapsed;
+        startMilliseconds = UserAircraft.Records[trimFrame].milliseconds;
         currentFrame = 0;
         CurrentFrameChanged?.Invoke(this, new(currentFrame));
-        Records = Records.Skip(trimFrame).ToList();
-        RecordsUpdated?.Invoke(this, new(null, startState?.AircraftTitle, Records.Count));
+        UserAircraft.Records = UserAircraft.Records.Skip(trimFrame).ToList();
+        RecordsUpdated?.Invoke(this, new(null, startState?.AircraftTitle, UserAircraft.Records.Count));
     }
 
     public void TrimEnd()
@@ -275,8 +388,8 @@ public class ReplayLogic : IReplayLogic, IDisposable
             CurrentFrameChanged?.Invoke(this, new(currentFrame));
         }
 
-        Records = Records.Take(trimFrame + 1).ToList();
-        RecordsUpdated?.Invoke(this, new(null, startState?.AircraftTitle, Records.Count));
+        UserAircraft.Records = UserAircraft.Records.Take(trimFrame + 1).ToList();
+        RecordsUpdated?.Invoke(this, new(null, startState?.AircraftTitle, UserAircraft.Records.Count));
     }
 
     public void ChangeRate(double rate)
@@ -293,39 +406,104 @@ public class ReplayLogic : IReplayLogic, IDisposable
     {
         if (replayMilliseconds != null)
         {
-            if (!IsAI(AircraftTitle))
-            {
+            if (this.playUserAircraft)
                 connector.Unfreeze(0);
-            }
-            else if (aiId.HasValue)
+
+            if (this.playAiArcraft)
             {
-                connector.Unfreeze(aiId.Value);
+                foreach (var plane in AiAircraftList)
+                {
+                    if (plane.aiId != null)
+                    {
+                        connector.Unfreeze((uint)plane.aiId);
+                    }
+                }
             }
         }
     }
 
+    /*
     public void NotifyPosition(AircraftPositionStruct? value)
     {
         currentPosition = value;
     }
+    */
 
     public void FromData(string? fileName, SavedData data)
     {
-        startMilliseconds = data.StartTime;
-        endMilliseconds = data.EndTime;
-        startState = data.StartState == null ? null : SimState.ToStruct(data.StartState);
+        startMilliseconds = data.UserArcraft.StartTime;
+        endMilliseconds = data.UserArcraft.EndTime;
+        startState = data.UserArcraft.SimState == null ? null : SimState.ToStruct(data.UserArcraft.SimState);
+        UserArcraftID = data.UserArcraft.UserArcraftID;
+
+
+        //--- convert AI aircrafts
+        AiAircraftList = new List<AiAircraft>();
+
+        foreach (var aircraft in  data.AiAircraftList)
+        {
+            var mylist2 = new List<AiAircraftRecord>();
+            if ((aircraft != null) && (aircraft.Records != null))
+            {
+                foreach (var record in aircraft.Records)
+                {
+
+                    if (record.Position != null)
+                    {
+                        mylist2.Add( new AiAircraftRecord { milliseconds = record.Time, position = (AiAircraftPositionStruct?)AiAircraftPosition.ToStruct(record.Position) });
+                    }
+                    else
+                    {
+                        mylist2.Add(new AiAircraftRecord { milliseconds = record.Time, position = null });
+                    }
+                }
+            }
+            SimStateStruct? aiState = aircraft.AircraftStatus == null ? null : SimState.ToStruct(aircraft.AircraftStatus);
+
+            AiAircraft ai = new AiAircraft { AircraftStatus = aiState, Minutes = aircraft.Minutes, ObjectID = aircraft.objectID, StartIndex=aircraft.StartIndex, StopIndex = aircraft.StopIndex, Records = mylist2  };
+            AiAircraftList.Add(ai);
+        }
+
         Reset();
-        Records = data.Records.Select(r => (r.Time, AircraftPosition.ToStruct(r.Position))).ToList();
-        RecordsUpdated?.Invoke(this, new(fileName, data.StartState?.AircraftTitle, Records.Count));
+
+        //--- convert User aircraft
+
+        var mylist = new List<AircraftRecord>();
+        if (data.UserArcraft.Records != null) 
+        {
+
+            foreach (var record in data.UserArcraft.Records)
+            {
+
+                if (record.Position != null)
+                {
+                    mylist.Add(new AircraftRecord { milliseconds = record.Time, position = (AircraftPositionStruct?)AircraftPosition.ToStruct(record.Position) });
+                }
+                else
+                {
+                    mylist.Add(new AircraftRecord { milliseconds = record.Time, position = null });
+                }
+            }
+        }
+
+        SimStateStruct? userState = data.UserArcraft.SimState == null ? null : SimState.ToStruct(data.UserArcraft.SimState);
+
+        UserAircraft = new UserAircraft { SimState = userState,  Records = mylist, UserArcraftID=data.UserArcraft.UserArcraftID, EndTime = data.UserArcraft.EndTime, StartTime = data.UserArcraft.StartTime};
+
+
+
+        RecordsUpdated?.Invoke(this, new(fileName, data.UserArcraft.SimState?.AircraftTitle, data.UserArcraft.Records.Count));
         CurrentFrameChanged?.Invoke(this, new(currentFrame));
     }
 
+    /*
     public SavedData ToData(string clientVersion)
     {
         if (startMilliseconds == null) throw new InvalidOperationException("Invalid replay data without start time!");
         if (endMilliseconds == null) throw new InvalidOperationException("Invalid replay data without end time!");
         return new(clientVersion, startMilliseconds.Value, endMilliseconds.Value, startState, Records);
     }
+    */
 
     #endregion
 
@@ -333,22 +511,20 @@ public class ReplayLogic : IReplayLogic, IDisposable
 
     private void Connector_AircraftIdReceived(object? sender, AircraftIdReceivedEventArgs e)
     {
-        if (IsAI(AircraftTitle) && aiRequestId == e.RequestId && aiId == null)
+        // search RequestID
+        foreach (var plane in AiAircraftList)
         {
-            logger.LogDebug("Set AI ID {objectID}", e.ObjectId);
-            aiRequestId = null;
-            aiId = e.ObjectId;
+            if ((plane.aiRequestId != null) && (plane.aiRequestId == e.RequestId))
+            {
+                logger.LogDebug("Set AI ID {objectID}", e.ObjectId);
+                plane .aiId= e.ObjectId;
+            }
         }
     }
 
     private void Connector_CreatingObjectFailed(object? sender, EventArgs e)
     {
-        if (IsAI(AircraftTitle) && aiRequestId != null)
-        {
-            logger.LogDebug("Fail to spawn for request {requestID}", aiRequestId);
-            aiRequestId = null;
-            StopReplay();
-        }
+            logger.LogDebug("Fail to spawn for request");
     }
 
     private void Connector_Frame(object? sender, EventArgs e)
@@ -367,19 +543,17 @@ public class ReplayLogic : IReplayLogic, IDisposable
         //timer = new Timer();
         //timer.Elapsed += Timer_Elapsed;
         //timer.Start();
-
-        if (!IsAI(AircraftTitle))
-        {
+        if (this.playUserAircraft)
             connector.Freeze(0);
-        }
 
-        var enumerator = Records.GetEnumerator();
+
+        var enumerator = UserAircraft.Records.GetEnumerator();
         currentFrame = -1;
         long? recordedElapsed = null;
-        AircraftPositionStruct? position = null;
+        //AircraftPositionStruct? position = null;
 
         long? lastElapsed = 0;
-        AircraftPositionStruct? lastPosition = null;
+        //AircraftPositionStruct? lastPosition = null;
 
         while (true)
         {
@@ -389,6 +563,8 @@ public class ReplayLogic : IReplayLogic, IDisposable
             tcs = new TaskCompletionSource<bool>();
             await tcs.Task;
             tcs = null;
+
+            logger.LogTrace("RunReplay - after tick {currentFrame} {isReplayStopping} {forceReset} {recordedElapsed} {IsPausing}", currentFrame, isReplayStopping, forceReset, recordedElapsed, IsPausing);
 
             if (isReplayStopping)
             {
@@ -403,11 +579,13 @@ public class ReplayLogic : IReplayLogic, IDisposable
                 continue;
             }
 
+            /* Hoping not to break all
             if (IsAI(AircraftTitle) && aiId == null)
             {
                 // Wait for spawning
                 continue;
             }
+            */
 
             if (IsPausing)
             {
@@ -417,41 +595,43 @@ public class ReplayLogic : IReplayLogic, IDisposable
             if (forceReset || (pausedFrame != null && pausedFrame != currentFrame))
             {
                 // Reset the enumerator since user might seek backward or change changed due to trimming
-                logger.LogDebug("Reset interaction. Pause frame {frame}.", pausedFrame);
+                logger.LogTrace("RunReplay - Reset interaction. Pause frame {frame}.", pausedFrame);
 
                 forceReset = false;
 
-                enumerator = Records.GetEnumerator();
+                enumerator = UserAircraft.Records.GetEnumerator();
                 currentFrame = -1;
                 recordedElapsed = null;
-                position = null;
+                //position = null;
 
                 pausedFrame = null;
             }
 
             var currentElapsed = (long)((stopwatch.ElapsedMilliseconds - replayStartTime.Value) * rate);
+            logger.LogTrace("RunReplay - new currentElapsed:{currentElapsed} - recordedElapsed: {recordedElapsed}", currentElapsed, recordedElapsed);
 
             try
             {
                 while (!recordedElapsed.HasValue || currentElapsed > recordedElapsed)
                 {
-                    logger.LogTrace("Move next {currentElapsed}", currentElapsed);
+                    logger.LogTrace("RunReplay - Calculate recordedElapsed - Move next {currentElapsed}", currentElapsed);
                     var canMove = enumerator.MoveNext();
 
                     if (canMove)
                     {
                         currentFrame++;
-                        (var recordedMilliseconds, var recordedPosition) = enumerator.Current;
+                        AircraftRecord rec = enumerator.Current;
                         lastElapsed = recordedElapsed;
-                        lastPosition = position;
-                        recordedElapsed = recordedMilliseconds - startMilliseconds;
-                        position = recordedPosition;
+                        //lastPosition = position;
+                        recordedElapsed = rec.milliseconds - startMilliseconds;
+                        //position = recordedPosition;
 
                         // Try to check the velocity
                     }
                     else
                     {
                         // Last frame
+                        logger.LogTrace("RunReplay - Last frame");
                         FinishReplay(true);
                         return;
                     }
@@ -459,38 +639,64 @@ public class ReplayLogic : IReplayLogic, IDisposable
             }
             finally
             {
-                logger.LogTrace("Current Frame {currentFrame} {ellapsed}", currentFrame, currentElapsed);
+                logger.LogTrace("RunReplay - finally - Current Frame {currentFrame} {ellapsed}", currentFrame, currentElapsed);
                 CurrentFrameChanged?.Invoke(this, new(currentFrame));
             }
 
-            if (position.HasValue && recordedElapsed.HasValue)
+            logger.LogTrace("RunReplay - before moving aircrafts {recordedElapsed} ", recordedElapsed);
+
+            if (recordedElapsed.HasValue)
             {
-                MoveAircraft(recordedElapsed.Value, position.Value, lastElapsed, lastPosition, currentElapsed);
+                logger.LogTrace("RunReplay - moving aircrafts {currentFrame} ", currentFrame);
+                if (this.playUserAircraft)
+                    MoveAircraft((uint)UserAircraft.UserArcraftID, recordedElapsed.Value, UserAircraft.Records[currentFrame].position, null, null, 0);
+                
+                if (this.playAiArcraft)
+                {
+                    int i = 0;
+                    foreach (var avion in AiAircraftList)
+                    {
+                        if (avion != null)
+                        {
+                            if ((avion.StartIndex <= currentFrame) && (avion.StopIndex >= currentFrame))
+                                MoveAiAircraft((uint)avion.aiId, recordedElapsed.Value, avion.Records[currentFrame - avion.StartIndex].position, null, null, 0);
+
+                            if (avion.StopIndex + 1 == currentFrame)
+                            {
+                                // would need to despawn aircraft when last index
+                                MoveAiAircraft((uint)avion.aiId, recordedElapsed.Value, aidefaultPosition, null, null, 0);
+                            }
+                        }
+
+                        ++i;
+                    }
+                }
             }
+
+            logger.LogTrace("RunReplay - after moving aircrafts {currentFrame} ", currentFrame);
         }
     }
 
     private void FinishReplay(bool reachedLastFrame)
     {
-        logger.LogInformation("Replay finished.");
+        logger.LogInformation("RunReplay - Replay finished.");
 
         isReplayStopping = false;
-
-        if (IsAI(AircraftTitle))
+        Unfreeze();
+        
+        if (this.playAiArcraft)
         {
-            //timer.Stop();
-            //timer = null;
-
-            if (aiId.HasValue)
+            foreach (var avion in AiAircraftList)
             {
-                connector.Despawn(aiId.Value);
-                aiId = null;
+                if (avion.aiId != null)
+                {
+                    connector.Despawn((uint)avion.aiId);
+                    avion.aiId = null;
+                }
             }
         }
-        else
-        {
-            Unfreeze();
-        }
+
+
 
         Reset();
 
@@ -511,13 +717,39 @@ public class ReplayLogic : IReplayLogic, IDisposable
         replayMilliseconds = null;
         currentFrame = 0;
         offsetStartMilliseconds = 0;
+
+
+        if (AiAircraftList != null)
+        {
+            foreach (var aircraft in AiAircraftList)
+            {
+                aircraft.aiId = null;
+                aircraft.aiRequestId = null;
+            }
+
+        }
+
     }
 
-    private void MoveAircraft(long nextElapsed, AircraftPositionStruct position, long? lastElapsed, AircraftPositionStruct? lastPosition, long currentElapsed)
-    {
-        logger.LogTrace("Delta time {delta} {current} {recorded}.", currentElapsed - nextElapsed, currentElapsed, nextElapsed);
 
-        var nextValue = AircraftPositionStructOperator.ToSet(position);
+
+    private void MoveAircraft(uint dwObjectId, long nextElapsed, AircraftPositionStruct? position, long? lastElapsed, AircraftPositionStruct? lastPosition, long currentElapsed)
+    {
+        logger.LogTrace("MoveAircraft - 1 Delta time {dwObjectId} {delta} {current} {recorded}.", dwObjectId, currentElapsed - nextElapsed, currentElapsed, nextElapsed);
+
+        if (position == null)
+            return;
+            
+
+        logger.LogTrace("MoveAircraft - 1b {dwObjectId}.", dwObjectId);
+
+        var nextValue = AircraftPositionStructOperator.ToSet((AircraftPositionStruct)position);
+
+        /*
+        
+
+        logger.LogTrace("MoveAircraft - 1a {dwObjectId}.", dwObjectId);
+
         if (lastPosition.HasValue && lastElapsed.HasValue)
         {
             var interpolation = (double)(currentElapsed - lastElapsed.Value) / (nextElapsed - lastElapsed.Value);
@@ -528,13 +760,65 @@ public class ReplayLogic : IReplayLogic, IDisposable
             }
             nextValue = AircraftPositionStructOperator.Interpolate(nextValue, AircraftPositionStructOperator.ToSet(lastPosition.Value), interpolation);
         }
-        if (!IsAI(AircraftTitle) && currentPosition.HasValue && (lastTriggeredMilliseconds == null || stopwatch.ElapsedMilliseconds > lastTriggeredMilliseconds + EventThrottleMilliseconds))
+        */
+
+        //logger.LogTrace("MoveAircraft - 2 {dwObjectId}.", dwObjectId);
+        /*
+        if ((dwObjectId != UserArcraftID) && currentPosition.HasValue && (lastTriggeredMilliseconds == null || stopwatch.ElapsedMilliseconds > lastTriggeredMilliseconds + EventThrottleMilliseconds))
         {
             lastTriggeredMilliseconds = stopwatch.ElapsedMilliseconds;
-            connector.TriggerEvents(currentPosition.Value, position);
+            connector.TriggerEvents(currentPosition.Value, (AircraftPositionStruct)position);
         }
+        */
+        
 
-        connector.Set(aiId ?? 0, nextValue);
+        connector.Set(dwObjectId, nextValue);
+        logger.LogTrace("MoveAircraft - 3 {dwObjectId}.", dwObjectId);
+    }
+
+
+
+    private void MoveAiAircraft(uint dwObjectId, long nextElapsed, AiAircraftPositionStruct? position, long? lastElapsed, AiAircraftPositionStruct? lastPosition, long currentElapsed)
+    {
+        logger.LogTrace("MoveAircraft - 1 Delta time {dwObjectId} {delta} {current} {recorded}.", dwObjectId, currentElapsed - nextElapsed, currentElapsed, nextElapsed);
+
+        if (position == null)
+            return;
+
+
+        logger.LogTrace("MoveAircraft - 1b {dwObjectId}.", dwObjectId);
+
+        var nextValue = AiAircraftPositionStructOperator.ToSet((AiAircraftPositionStruct)position);
+
+        /*
+        var nextValue = AircraftPositionStructOperator.ToSet((AircraftPositionStruct)position);
+
+        logger.LogTrace("MoveAircraft - 1a {dwObjectId}.", dwObjectId);
+
+        if (lastPosition.HasValue && lastElapsed.HasValue)
+        {
+            var interpolation = (double)(currentElapsed - lastElapsed.Value) / (nextElapsed - lastElapsed.Value);
+            if (interpolation == 0.5)
+            {
+                // Edge case: let next value win so Math.round does not act unexpectedly
+                interpolation = 0.501;
+            }
+            nextValue = AircraftPositionStructOperator.Interpolate(nextValue, AircraftPositionStructOperator.ToSet(lastPosition.Value), interpolation);
+        }
+        */
+
+        logger.LogTrace("MoveAircraft - 2 {dwObjectId}.", dwObjectId);
+        /*
+        if ((dwObjectId != UserArcraftID) && currentPosition.HasValue && (lastTriggeredMilliseconds == null || stopwatch.ElapsedMilliseconds > lastTriggeredMilliseconds + EventThrottleMilliseconds))
+        {
+            lastTriggeredMilliseconds = stopwatch.ElapsedMilliseconds;
+            connector.TriggerAiEvents(currentPosition.Value, (AiAircraftPositionStruct)position);
+        }
+        */
+
+
+        connector.Set(dwObjectId, nextValue);
+        logger.LogTrace("MoveAircraft - 3 {dwObjectId}.", dwObjectId);
     }
 
     private void Tick()
